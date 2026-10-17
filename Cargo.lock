@@ -3106,6 +3106,7 @@ name = "lightcraft-catalog"
 version = "0.8.0"
 dependencies = [
  "crc32fast",
+ "libc",
  "lightcraft-develop",
  "lightcraft-geom",
  "lightcraft-meta",
@@ -3116,6 +3117,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "web-time",
+ "winapi-util",
 ]
 
 [[package]]
@@ -3408,9 +3410,11 @@ name = "lightcraft-preview"
 version = "0.8.0"
 dependencies = [
  "jpeg-encoder",
+ "libc",
  "lightcraft-raster",
  "log",
  "siphasher",
+ "winapi-util",
  "zune-core",
  "zune-jpeg",
 ]

@@ -85,6 +85,9 @@ pub enum LockError {
     /// Another process has the library open.
     #[error("This library is already open in {}. Close it there first.", .0.as_ref().map(LockOwner::describe).unwrap_or_else(|| "another LightCraft program".into()))]
     InUse(Option<LockOwner>),
+    /// Unsafe lock entries must not silently disable mutual exclusion.
+    #[error("The library lock is not a safe regular file: {0}")]
+    UnsafeFile(io::Error),
 }
 
 /// The exclusive lock on a library directory; released on drop (and by the OS if the process
@@ -97,28 +100,53 @@ pub struct LibraryLock {
     held: bool,
 }
 
+fn unsafe_lock_entry(error: &io::Error, path: &Path) -> bool {
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return true;
+            }
+        }
+    }
+    if error.kind() == io::ErrorKind::InvalidInput {
+        return true;
+    }
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return true;
+    }
+    false
+}
+
 impl LibraryLock {
-    /// Lock `dir` (which must exist) for this process. Fails only when another process holds it.
+    /// Lock `dir` (which must exist). Reject a held lock or an unsafe lock-file entry.
     pub fn acquire(dir: &Path, program: &str) -> Result<LibraryLock, LockError> {
         let unlocked = |why: io::Error| {
             log::warn!("library {}: can't lock {LOCK} ({why}); opening it without protection against a second program", dir.display());
             LibraryLock { dir: dir.to_path_buf(), file: None, held: false }
         };
-        let file = match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join(LOCK)) {
+        let file = match crate::safe_file::open_regular(&dir.join(LOCK), OpenOptions::new().read(true).write(true).create(true).truncate(false)) {
             Ok(f) => f,
+            Err(e) if unsafe_lock_entry(&e, &dir.join(LOCK)) => return Err(LockError::UnsafeFile(e)),
             Err(e) => return Ok(unlocked(e)),
         };
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                let owner = std::fs::read(dir.join(OWNER)).ok().and_then(|b| serde_json::from_slice::<LockOwner>(&b).ok());
+                let owner =
+                    crate::safe_file::read_regular(&dir.join(OWNER), 64 * 1024).ok().and_then(|b| serde_json::from_slice::<LockOwner>(&b).ok());
                 return Err(LockError::InUse(owner));
             }
             Err(TryLockError::Error(e)) => return Ok(unlocked(e)),
         }
         let owner = LockOwner::this_process(program);
         if let Ok(json) = serde_json::to_vec_pretty(&owner)
-            && let Err(e) = std::fs::write(dir.join(OWNER), json)
+            && let Err(e) = crate::safe_file::write_atomic(&dir.join(OWNER), &json)
         {
             log::warn!("library {}: can't write {OWNER}: {e}", dir.display());
         }
@@ -158,5 +186,37 @@ impl Drop for LibraryLock {
                 log::warn!("library {}: can't release {LOCK}: {e}", self.dir.display());
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests_owner_link {
+    use super::*;
+
+    #[test]
+    fn linked_lock_is_an_error_not_unlocked_access() {
+        let dir = std::env::temp_dir().join(format!("lc-lock-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join(LOCK)).unwrap();
+        assert!(matches!(LibraryLock::acquire(&dir, "test"), Err(LockError::UnsafeFile(_))));
+        assert_eq!(std::fs::read(victim).unwrap(), b"keep");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn owner_note_replaces_link_without_touching_target() {
+        let dir = std::env::temp_dir().join(format!("lc-owner-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join(OWNER)).unwrap();
+        let lock = LibraryLock::acquire(&dir, "test").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert!(!std::fs::symlink_metadata(dir.join(OWNER)).unwrap().file_type().is_symlink());
+        drop(lock);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

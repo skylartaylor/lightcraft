@@ -85,7 +85,7 @@ fn create_staging(tmp: &std::path::Path) -> io::Result<std::fs::File> {
 
 impl Store for FsStore {
     fn read(&mut self, name: &str) -> io::Result<Option<Vec<u8>>> {
-        match std::fs::read(self.path(name)) {
+        match crate::safe_file::read_regular(&self.path(name), u64::MAX - 1) {
             Ok(b) => Ok(Some(b)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
@@ -138,7 +138,7 @@ impl Store for FsStore {
         use std::io::Write;
         if self.appender.as_ref().is_none_or(|(n, _)| n != name) {
             let existed = self.path(name).exists();
-            let f = std::fs::OpenOptions::new().create(true).append(true).open(self.path(name))?;
+            let f = crate::safe_file::open_regular(&self.path(name), std::fs::OpenOptions::new().create(true).append(true))?;
             if !existed {
                 self.sync_dir();
             }
@@ -159,7 +159,7 @@ impl Store for FsStore {
         if self.appender.as_ref().is_some_and(|(n, _)| n == name) {
             self.appender = None;
         }
-        let f = match std::fs::OpenOptions::new().write(true).open(self.path(name)) {
+        let f = match crate::safe_file::open_regular(&self.path(name), std::fs::OpenOptions::new().write(true)) {
             Ok(f) => f,
             // nothing to cut (an append that failed before creating the file)
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -265,5 +265,38 @@ mod tests_staging {
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
         assert_eq!(std::fs::read(dir.join("catalog.log")).unwrap(), b"[1]");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests_hostile_entries {
+    use super::*;
+
+    #[test]
+    fn catalog_links_cannot_read_append_or_truncate_external_files() {
+        let dir = std::env::temp_dir().join(format!("lc-hostile-store-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"keep-private").unwrap();
+        let mut store = FsStore::open(&dir).unwrap();
+        for name in ["prefs.json", "catalog.log"] {
+            std::os::unix::fs::symlink(&victim, dir.join(name)).unwrap();
+            assert!(store.read(name).is_err());
+            assert!(store.append(name, b"bad").is_err());
+            assert!(store.truncate(name, 0).is_err());
+            assert_eq!(std::fs::read(&victim).unwrap(), b"keep-private");
+        }
+        std::fs::hard_link(&victim, dir.join("linked.log")).unwrap();
+        assert!(store.append("linked.log", b"bad").is_err());
+        assert!(store.truncate("linked.log", 0).is_err());
+        assert!(store.read("linked.log").is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep-private");
+        // Ordinary journal writes still work, including the retained append handle.
+        store.append("regular.log", b"ab").unwrap();
+        store.append("regular.log", b"cd").unwrap();
+        store.truncate("regular.log", 2).unwrap();
+        assert_eq!(store.read("regular.log").unwrap().unwrap(), b"ab");
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

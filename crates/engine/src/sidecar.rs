@@ -405,16 +405,15 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 }
 
 /// Copy `path` to a new `<name>.bak-<stamp>` (`-1`, `-2`… if taken; never overwriting).
-fn backup(path: &Path, stamp: &str) -> std::io::Result<PathBuf> {
+fn backup(path: &Path, stamp: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
     use std::io::Write;
-    let bytes = std::fs::read(path)?;
     let stamp: String = stamp.chars().filter(char::is_ascii_alphanumeric).collect();
     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     for k in 0..1000 {
         let b = path.with_file_name(if k == 0 { format!("{name}.bak-{stamp}") } else { format!("{name}.bak-{stamp}-{k}") });
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&b) {
             Ok(mut f) => {
-                f.write_all(&bytes)?;
+                f.write_all(bytes)?;
                 f.sync_all()?;
                 return Ok(b);
             }
@@ -438,7 +437,7 @@ pub struct SidecarSaved {
 /// The new contents for the sidecar at `path`: `fresh` merged into the existing file, if any.
 /// Returns (contents, merged, backup).
 fn sidecar_contents(path: &Path, fresh: String, stamp: &str) -> std::io::Result<(String, bool, Option<PathBuf>)> {
-    let bytes = match std::fs::read(path) {
+    let bytes = match lightcraft_catalog::safe_file::read_regular(path, 64 << 20) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((fresh, false, None)),
         // can't see what is there: never overwrite it blindly
@@ -454,7 +453,7 @@ fn sidecar_contents(path: &Path, fresh: String, stamp: &str) -> std::io::Result<
     {
         Ok(merged) => Ok((merged, true, None)),
         Err(why) => {
-            let b = backup(path, stamp)?;
+            let b = backup(path, stamp, &bytes)?;
             log::warn!("{}: not readable as XMP ({why}); kept a copy as {} before replacing it", path.display(), b.display());
             Ok((fresh, false, Some(b)))
         }
@@ -929,3 +928,26 @@ mod tests_repair_provenance;
 #[cfg(test)]
 #[path = "sidecar/tests_stem_owners.rs"]
 mod tests_stem_owners;
+
+#[cfg(all(test, unix))]
+mod tests_hostile_sidecar {
+    use super::*;
+
+    #[test]
+    fn linked_sidecar_is_not_read_or_copied_into_a_backup() {
+        let dir = std::env::temp_dir().join(format!("lc-sidecar-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("private-fixture");
+        std::fs::write(&victim, b"private fixture, not XMP").unwrap();
+        let sidecar = dir.join("photo.xmp");
+        std::os::unix::fs::symlink(&victim, &sidecar).unwrap();
+        assert!(sidecar_contents(&sidecar, "fresh".into(), "test").is_err());
+        assert!(!dir.join("photo.xmp.bak-test").exists());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"private fixture, not XMP");
+        std::fs::remove_file(&sidecar).unwrap();
+        std::fs::write(&sidecar, b"damaged XMP").unwrap();
+        let copied = backup(&sidecar, "test", b"damaged XMP").unwrap();
+        assert_eq!(std::fs::read(copied).unwrap(), b"damaged XMP");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

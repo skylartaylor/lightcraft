@@ -124,16 +124,16 @@ impl DiskCache {
         let p = self.path(key);
         // a shard that is a symlink (or junction) leads outside the cache: nothing is read
         // through it, under either name
-        if !p.parent().is_some_and(is_real_dir) {
+        if !is_real_dir(&self.dir) || !p.parent().is_some_and(is_real_dir) {
             return None;
         }
-        if let Ok(bytes) = std::fs::read(&p) {
+        if let Ok(bytes) = read_cache_regular(&p) {
             return Some((p, bytes));
         }
         let old = self.named(key, OLD_EXT);
-        let Ok(bytes) = std::fs::read(&old) else {
+        let Ok(bytes) = read_cache_regular(&old) else {
             // (taken over by the tidying between the two looks: it is under the new name now)
-            return std::fs::read(&p).ok().map(|bytes| (p, bytes));
+            return read_cache_regular(&p).ok().map(|bytes| (p, bytes));
         };
         // (taken over; if that can't be done it is read where it is, and tried again next time)
         match std::fs::rename(&old, &p) {
@@ -157,7 +157,7 @@ impl DiskCache {
                 let now = std::time::SystemTime::now();
                 let unused = std::fs::metadata(&p).and_then(|m| m.modified()).ok().and_then(|at| now.duration_since(at).ok());
                 if unused.is_some_and(|d| d > STALE)
-                    && let Ok(f) = std::fs::File::options().write(true).open(&p)
+                    && let Ok(f) = open_cache_regular(&p, true)
                 {
                     let _ = f.set_modified(now);
                 }
@@ -178,21 +178,24 @@ impl DiskCache {
         let Some(parent) = p.parent() else { return };
         // a folder the cache makes for itself says that it is a cache; one that was there
         // already may hold somebody's files, and is not declared one
-        let made = !self.dir.exists();
+        let made = match std::fs::symlink_metadata(&self.dir) {
+            Ok(_) if !is_real_dir(&self.dir) => return,
+            Ok(_) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => return,
+        };
         if std::fs::create_dir_all(parent).is_err() || !is_real_dir(parent) {
             return;
         }
         if made {
-            let _ = std::fs::write(self.dir.join(TAG), TAG_TEXT);
+            let _ = replace_cache_file(&self.dir.join(TAG), TAG_TEXT.as_bytes());
         }
         // Serialize the file replacement and its size accounting. A repeated render of
         // the same key replaces its JPEG; it must not count as another cache entry.
         let mut total = self.total.lock().unwrap_or_else(|e| e.into_inner());
         let used = total.get_or_insert_with(|| self.scan().iter().map(|f| f.1).sum());
         let old_len = std::fs::metadata(&p).map_or(0, |m| m.len());
-        let tmp = p.with_extension(format!("tmp{:?}", std::thread::current().id()).replace(['(', ')'], ""));
-        if std::fs::write(&tmp, &bytes).is_err() || std::fs::rename(&tmp, &p).is_err() {
-            let _ = std::fs::remove_file(&tmp);
+        if replace_cache_file(&p, &bytes).is_err() {
             return;
         }
         self.writes.fetch_add(1, Ordering::Relaxed);
@@ -213,6 +216,9 @@ impl DiskCache {
     /// [`Self::scan`], given up (`None`) when `stop` says so, which is asked for each shard.
     fn scan_until(&self, stop: &dyn Fn() -> bool) -> Option<Vec<(PathBuf, u64, std::time::SystemTime)>> {
         let mut out = Vec::new();
+        if !is_real_dir(&self.dir) {
+            return Some(out);
+        }
         let Ok(rd) = std::fs::read_dir(&self.dir) else { return Some(out) };
         for sub in rd.flatten() {
             if stop() {
@@ -249,7 +255,7 @@ impl DiskCache {
     /// is there, and neither made by a cache that names them as now (which tags it, [`TAG`])
     /// nor looked through by one ([`TIDIED`]). Cheap: asked when a library opens.
     pub fn needs_tidying(&self) -> bool {
-        self.dir.is_dir() && !self.dir.join(TAG).exists() && !self.dir.join(TIDIED).exists()
+        is_real_dir(&self.dir) && !self.dir.join(TAG).exists() && !self.dir.join(TIDIED).exists()
     }
 
     /// Take over the thumbnails cached under the name of before: each `<32 hex>.jpg` of the
@@ -262,6 +268,9 @@ impl DiskCache {
     /// This walks the whole folder and renames file by file (a cache of 2 GB is some 100 000
     /// files): it is for a background thread, never for the interface.
     pub fn take_over_old(&self, stop: &dyn Fn() -> bool, progress: &dyn Fn(usize, usize)) -> usize {
+        if !is_real_dir(&self.dir) {
+            return 0;
+        }
         // (listed in full before anything is renamed: a folder that changes while it is listed
         // lists some of its files twice)
         let Some(listed) = self.scan_until(stop) else { return 0 };
@@ -294,9 +303,9 @@ impl DiskCache {
         // done, also when the folder holds other things; not when something could not be taken
         // over (a folder that can't be written: it is tried again at the next open)
         if !blocked {
-            let _ = std::fs::write(self.dir.join(TIDIED), b"");
+            let _ = replace_cache_file(&self.dir.join(TIDIED), b"");
             if self.holds_only_the_cache() {
-                let _ = std::fs::write(self.dir.join(TAG), TAG_TEXT);
+                let _ = replace_cache_file(&self.dir.join(TAG), TAG_TEXT.as_bytes());
             }
         }
         taken
@@ -380,7 +389,16 @@ impl DiskCache {
 
 /// Whether `p` is a directory itself, not a symlink or Windows reparse point to one.
 fn is_real_dir(p: &Path) -> bool {
-    std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
+    std::fs::symlink_metadata(p).is_ok_and(|m| {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if m.file_attributes() & 0x400 != 0 {
+                return false;
+            }
+        }
+        m.is_dir() && !m.file_type().is_symlink()
+    })
 }
 
 /// The key a cache file is of, by its name.
@@ -443,4 +461,126 @@ pub fn decode_jpeg(bytes: &[u8]) -> Option<Rgba8> {
     }
     let data = px.as_chunks::<3>().0.iter().take(w * h).map(|c| [c[0], c[1], c[2], 255]).collect();
     Some(Rgba8 { width: w, height: h, data })
+}
+
+/// Disposable cache replacement: exclusive staging prevents planted staging symlinks,
+/// and rename replaces the destination entry rather than writing through it.
+fn replace_cache_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for _ in 0..1000 {
+        let tmp = path.with_extension(format!("tmp{}x{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let written = file.write_all(bytes);
+        drop(file);
+        let result = written.and_then(|()| std::fs::rename(&tmp, path));
+        let _ = std::fs::remove_file(&tmp);
+        return result;
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free cache staging name"))
+}
+
+#[cfg(all(test, unix))]
+mod tests_linked_cache {
+    use super::*;
+
+    #[test]
+    fn cache_root_and_leaf_links_cannot_touch_external_fixtures() {
+        let dir = std::env::temp_dir().join(format!("lc-cache-root-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = dir.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let root = dir.join("thumbs");
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+        let cache = DiskCache::new(&root, 1024);
+        assert!(!cache.needs_tidying());
+        assert_eq!(cache.take_over_old(&|| false, &|_, _| {}), 0);
+        assert!(cache.scan().is_empty());
+        cache.put(Hash128(0), &Rgba8 { width: 1, height: 1, data: vec![[0, 0, 0, 255]] });
+        cache.clear();
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let leaf = dir.join("leaf");
+        std::os::unix::fs::symlink(&victim, &leaf).unwrap();
+        assert!(read_cache_regular(&leaf).is_err());
+        assert!(open_cache_regular(&leaf, true).is_err());
+        std::fs::remove_file(&leaf).unwrap();
+        std::fs::hard_link(&victim, &leaf).unwrap();
+        assert!(read_cache_regular(&leaf).is_err());
+        assert!(open_cache_regular(&leaf, true).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn markers_replace_symlinks_without_modifying_targets() {
+        let dir = std::env::temp_dir().join(format!("lc-marker-links-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        for name in [TAG, TIDIED, "preview.lcthumb"] {
+            let path = dir.join(name);
+            std::os::unix::fs::symlink(&victim, &path).unwrap();
+            replace_cache_file(&path, b"cache").unwrap();
+            assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+            assert_eq!(std::fs::read(path).unwrap(), b"cache");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+// Kept in this lower-layer crate to avoid a preview -> catalog dependency.
+fn open_cache_regular(path: &Path, write: bool) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(write);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("not a regular cache file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(std::io::Error::other("linked cache file"));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 || winapi_util::file::information(&file)?.number_of_links() != 1 {
+            return Err(std::io::Error::other("linked cache file"));
+        }
+    }
+    Ok(file)
+}
+
+fn read_cache_regular(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    const MAX: u64 = 64 * 1024 * 1024;
+    let file = open_cache_regular(path, false)?;
+    if file.metadata()?.len() > MAX {
+        return Err(std::io::Error::other("oversized cache file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX {
+        return Err(std::io::Error::other("oversized cache file"));
+    }
+    Ok(bytes)
 }

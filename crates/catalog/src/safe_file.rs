@@ -31,6 +31,62 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Open a regular file without following a final symlink/reparse point. The containing
+/// directory must be trusted: this does not prevent replacement of an ancestor directory.
+/// Callers must not request truncation: validate the returned handle before `set_len`.
+/// Unix nonblocking open prevents a planted FIFO from hanging before the type check.
+/// Multiply-linked native files are refused as well, so catalog edits cannot change an alias
+/// outside the library. No filesystem operation follows a rejected final symlink.
+pub fn open_regular(path: &Path, options: &OpenOptions) -> io::Result<File> {
+    let mut options = options.clone();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT: open the entry, not its target.
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "multiply-linked files are not accepted"));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 || winapi_util::file::information(&file)?.number_of_links() != 1 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "reparse points and multiply-linked files are not accepted"));
+        }
+    }
+    Ok(file)
+}
+
+/// Read a regular file without following its final symlink, with a streaming size bound.
+pub fn read_regular(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = open_regular(path, OpenOptions::new().read(true))?;
+    if file.metadata()?.len() > limit {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "file exceeds the read limit"));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "file exceeds the read limit"));
+    }
+    Ok(bytes)
+}
+
 thread_local! {
     static FAIL_AFTER: Cell<Option<u64>> = const { Cell::new(None) };
     static SYNCS: Cell<u64> = const { Cell::new(0) };
@@ -408,5 +464,24 @@ mod tests {
         assert!(!same_file(&p, &d.join("y.jpg")));
         assert!(!same_file(&p, &d.join("missing.jpg")));
         let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests_regular {
+    use super::*;
+
+    #[test]
+    fn regular_reads_are_bounded_and_reject_links_and_directories() {
+        let dir = std::env::temp_dir().join(format!("lc-regular-read-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("regular");
+        fs::write(&file, b"1234").unwrap();
+        assert_eq!(read_regular(&file, 4).unwrap(), b"1234");
+        assert!(read_regular(&file, 3).is_err());
+        std::os::unix::fs::symlink(&file, dir.join("link")).unwrap();
+        assert!(read_regular(&dir.join("link"), 10).is_err());
+        assert!(read_regular(&dir, 10).is_err());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -135,11 +135,7 @@ impl Index {
     }
 
     fn load(&mut self, path: &Path) {
-        let Ok(meta) = std::fs::metadata(path) else { return };
-        if meta.len() > MAX_FILE {
-            return;
-        }
-        let Ok(bytes) = std::fs::read(path) else { return };
+        let Ok(bytes) = lightcraft_catalog::safe_file::read_regular(path, MAX_FILE) else { return };
         let Some((tag_len, rest)) = bytes
             .strip_prefix(MAGIC)
             .and_then(|r| r.split_first())
@@ -201,7 +197,7 @@ impl Index {
             return Ok(());
         }
         if self.file_matches && !self.rewrite {
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path)?;
+            let mut f = lightcraft_catalog::safe_file::open_regular(&path, std::fs::OpenOptions::new().append(true))?;
             let mut buf = Vec::new();
             for (k, e) in &self.unsaved {
                 buf.extend(self.record(k, e));
@@ -212,9 +208,7 @@ impl Index {
             for (k, e) in &self.entries {
                 buf.extend(self.record(k, e));
             }
-            let part = path.with_extension("part");
-            std::fs::write(&part, &buf)?;
-            std::fs::rename(&part, &path)?;
+            lightcraft_catalog::safe_file::write_atomic(&path, &buf)?;
             self.file_matches = true;
             self.rewrite = false;
         }
@@ -317,11 +311,7 @@ impl Scanned {
     }
 
     fn load(&mut self, path: &Path) {
-        let Ok(meta) = std::fs::metadata(path) else { return };
-        if meta.len() > SCAN_MAX_FILE {
-            return;
-        }
-        let Ok(bytes) = std::fs::read(path) else { return };
+        let Ok(bytes) = lightcraft_catalog::safe_file::read_regular(path, SCAN_MAX_FILE) else { return };
         let head = self.header();
         let Some(rest) = bytes.strip_prefix(head.as_slice()) else { return };
         self.file_matches = true;
@@ -341,15 +331,13 @@ impl Scanned {
             return Ok(());
         }
         if self.file_matches && !self.rewrite {
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path)?;
+            let mut f = lightcraft_catalog::safe_file::open_regular(&path, std::fs::OpenOptions::new().append(true))?;
             let buf: Vec<u8> = self.unsaved.iter().flat_map(|id| id.to_le_bytes()).collect();
             f.write_all(&buf)?;
         } else {
             let mut buf = self.header();
             buf.extend(self.set.iter().flat_map(|id| id.to_le_bytes()));
-            let part = path.with_extension("part");
-            std::fs::write(&part, &buf)?;
-            std::fs::rename(&part, &path)?;
+            lightcraft_catalog::safe_file::write_atomic(&path, &buf)?;
             self.file_matches = true;
             self.rewrite = false;
         }
@@ -544,5 +532,33 @@ impl FacesState {
         self.index.forget_photo(id.0);
         self.scanned.remove(id.0);
         self.scan_failed.remove(&id.0);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests_hostile_index {
+    use super::*;
+
+    #[test]
+    fn scanned_append_rejects_replaced_symlink_and_rewrite_avoids_staging_link() {
+        let dir = std::env::temp_dir().join(format!("lc-scanned-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let path = dir.join("scanned");
+        let mut scanned = Scanned::default();
+        scanned.reset(Some(path.clone()));
+        scanned.insert(1);
+        std::os::unix::fs::symlink(&victim, path.with_extension("part")).unwrap();
+        scanned.save().unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        scanned.insert(2);
+        assert!(scanned.save().is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        // Clear the path so Drop does not retry a write after fixture cleanup.
+        scanned.reset(None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
